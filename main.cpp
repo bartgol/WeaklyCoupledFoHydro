@@ -4,6 +4,7 @@
 #include <Albany_CommUtils.hpp>
 #include <Albany_ModelEvaluator.hpp>
 #include <Albany_ScalarOrdinalTypes.hpp>
+#include <Albany_STKDiscretization.hpp>
 
 #include <Piro_PerformSolve.hpp>
 #include <Piro_PerformAnalysis.hpp>
@@ -42,8 +43,6 @@ int run_initialization_problem (const AlbanySolvers& solvers,
                                 Teuchos::RCP<Teuchos::FancyOStream> out);
 int run_iterative_inversion_problem (const AlbanySolvers& solvers,
                                      Teuchos::RCP<Teuchos::FancyOStream> out);
-
-Teuchos::RCP<Albany::ModelEvaluator> getAlbanyME (Teuchos::RCP<Thyra_ModelEvaluator> me);
 
 /////////////// IMPLEMENTATIONS /////////////////////
 
@@ -115,6 +114,7 @@ int main(int argc, char** argv) {
     }
   }
 
+  // Create solvers
   AlbanySolvers solvers = create_solvers(fo_inv_fname, hydro_inv_fname, fo_fwd_fname, coupling_fname);
 
   // Run initialization phase
@@ -147,8 +147,13 @@ AlbanySolvers create_solvers(const std::string& fo_inv_fname,
   solvers.m_inv_hydro_factory = Teuchos::rcp( new Albany::SolverFactory(hydro_inv_fname,comm) );
   solvers.m_fwd_fo_factory    = Teuchos::rcp( new Albany::SolverFactory(fo_fwd_fname,comm) );
 
+  Session::reset_build_type(solvers.m_inv_fo_factory->getParameters().get<std::string>("Build Type"));
   solvers.m_inv_fo_solver    = solvers.m_inv_fo_factory->create(comm,comm);
+
+  Session::reset_build_type(solvers.m_inv_hydro_factory->getParameters().get<std::string>("Build Type"));
   solvers.m_inv_hydro_solver = solvers.m_inv_hydro_factory->create(comm,comm);
+
+  Session::reset_build_type(solvers.m_fwd_fo_factory->getParameters().get<std::string>("Build Type"));
   solvers.m_fwd_fo_solver    = solvers.m_fwd_fo_factory->create(comm,comm);
 
   Teuchos::RCP<Teuchos::ParameterList> params = Teuchos::createParameterList("");
@@ -173,22 +178,54 @@ int run_initialization_problem (const AlbanySolvers& solvers,
   // Get the comm
   Teuchos::RCP<const Teuchos_Comm> comm = Albany::getDefaultComm();
 
-  auto solver = solvers.m_inv_fo_solver;
-  auto factory = *solvers.m_inv_fo_factory;
-  Session::reset_build_type(solvers.m_fwd_fo_factory->getParameters().get<std::string>("Build Type"));
+  auto fo_solver  = solvers.m_inv_fo_solver;
+  auto fo_factory = solvers.m_inv_fo_factory;
+  auto fo_model   = fo_factory->returnModel();
 
   // Solve
-  Teuchos::RCP<Thyra_Vector> p;
-  int status = Piro::PerformAnalysis(*solver,factory.getAnalysisParameters(),p);
+  Teuchos::Array<Teuchos::RCP<const Thyra_Vector>> responses;
+  Teuchos::Array<Teuchos::Array<Teuchos::RCP<const Thyra_MultiVector>>> sensitivities;
+  Piro::PerformSolve(*fo_solver,fo_factory->getAnalysisParameters(),responses,sensitivities);
 
-  // Get the computed basal velocity and basal traction
-  auto model = getAlbanyME(solver);
+  // Set basal traction and sliding velocity in the hydrology discretization
+  auto hydro_solver  = solvers.m_inv_hydro_solver;
+  auto hydro_factory = solvers.m_inv_hydro_factory;
+  auto hydro_model   = hydro_factory->returnModel();
 
-  // auto fo_inv_disc = fo_inv_albany_model->getApp()->getDiscretization();
+  auto basalSideName = fo_model->getApp()->getProblemPL()->get<std::string>("Basal Side Name");
 
+  auto fo_basal_disc = fo_model->getApp()->getDiscretization()->getSideSetDiscretizations().at(basalSideName);
+  auto hydro_disc    = hydro_model->getApp()->getDiscretization();
 
-  // Set the solution in the mesh
-  return status;
+  auto fo_basal_states = fo_basal_disc->getStateArrays().nodeStateArrays;
+  auto hydro_states = hydro_disc->getStateArrays().nodeStateArrays;
+
+  const size_t num_buckets = fo_basal_states.size();
+  const std::string slidingVelName = "sliding_velocity";
+  const std::string tractionName   = "basal_traction";
+  for (size_t ib=0; ib<num_buckets; ++ib) {
+    // Set computed sliding velocity on basal mesh
+    auto sliding_v_hydro = hydro_states[ib].at(slidingVelName);
+    auto sliding_v_fo = fo_basal_states[ib].at(slidingVelName+"_"+basalSideName);
+
+    ALBANY_ASSERT(sliding_v_hydro.size()==sliding_v_fo.size(),
+                  "Error! Something is wrong with states dimensions.\n");
+    for (auto i = decltype(sliding_v_fo.size())(0); i<sliding_v_fo.size(); ++i) {
+      sliding_v_hydro(i) = sliding_v_fo(i);
+    }
+
+    // Set computed traction field on mesh
+    auto traction_hydro = hydro_states[ib].at(slidingVelName);
+    auto traction_fo = fo_basal_states[ib].at(slidingVelName+"_"+basalSideName);
+
+    ALBANY_ASSERT(traction_hydro.size()==traction_fo.size(),
+                  "Error! Something is wrong with states dimensions.\n");
+    for (auto i = decltype(traction_fo.size())(0); i<traction_fo.size(); ++i) {
+      traction_hydro(i) = traction_fo(i);
+    }
+  }
+
+  return 0;
 }
 
 int run_iterative_inversion_problem (const AlbanySolvers& solvers,
@@ -207,14 +244,29 @@ int run_iterative_inversion_problem (const AlbanySolvers& solvers,
 
   auto hydro_solver  = solvers.m_inv_hydro_solver;
   auto hydro_factory = solvers.m_inv_hydro_factory;
-  auto hydro_model   = getAlbanyME(hydro_solver);
+  auto hydro_model   = hydro_factory->returnModel();
 
   auto fo_solver  = solvers.m_fwd_fo_solver;
   auto fo_factory = solvers.m_fwd_fo_factory;
-  auto fo_model   = getAlbanyME(fo_solver);
+  auto fo_model   = fo_factory->returnModel();
 
   auto hydro_bt = solvers.m_inv_hydro_factory->getParameters().get<std::string>("Build Type");
   auto fo_bt    = solvers.m_fwd_fo_factory->getParameters().get<std::string>("Build Type");
+
+  auto basalSideName = fo_model->getApp()->getProblemPL()->get<std::string>("Basal Side Name");
+
+  auto fo_basal_disc = fo_model->getApp()->getDiscretization()->getSideSetDiscretizations().at(basalSideName);
+  auto hydro_disc    = hydro_model->getApp()->getDiscretization();
+
+  auto fo_basal_states = fo_basal_disc->getStateArrays().nodeStateArrays;
+  auto hydro_states = hydro_disc->getStateArrays().nodeStateArrays;
+
+  const size_t num_buckets = fo_basal_states.size();
+  ALBANY_ASSERT (num_buckets==hydro_states.size(),
+                 "Error! Something is wrong with the buckets size.\n");
+
+  const std::string effPressName   = "effective_pressure";
+  const std::string slidingVelName = "sliding_velocity";
 
   RealType error = 1;
   int status = 0;
@@ -223,6 +275,28 @@ int run_iterative_inversion_problem (const AlbanySolvers& solvers,
     // Solve inverse hydrology
     Session::reset_build_type(hydro_bt);
 
+    // Set inputs in hydrology discretization
+    for (size_t ib=0; ib<num_buckets; ++ib) {
+      // Set computed sliding velocity on basal mesh
+      auto sliding_v_hydro = hydro_states[ib].at(slidingVelName);
+      auto sliding_v_fo = fo_basal_states[ib].at(slidingVelName+"_"+basalSideName);
+
+      ALBANY_ASSERT(sliding_v_hydro.size()==sliding_v_fo.size(),
+                    "Error! Something is wrong with states dimensions.\n");
+      for (auto i = decltype(sliding_v_fo.size())(0); i<sliding_v_fo.size(); ++i) {
+        sliding_v_hydro(i) = sliding_v_fo(i);
+      }
+
+      // Set computed traction field on mesh
+      auto traction_hydro = hydro_states[ib].at(slidingVelName);
+      auto traction_fo = fo_basal_states[ib].at(slidingVelName+"_"+basalSideName);
+
+      ALBANY_ASSERT(traction_hydro.size()==traction_fo.size(),
+                    "Error! Something is wrong with states dimensions.\n");
+      for (auto i = decltype(traction_fo.size())(0); i<traction_fo.size(); ++i) {
+        traction_hydro(i) = traction_fo(i);
+      }
+    }
     status = Piro::PerformAnalysis(*hydro_solver,hydro_factory->getAnalysisParameters(),p);
 
     // If something went wrong, quit
@@ -240,20 +314,19 @@ int run_iterative_inversion_problem (const AlbanySolvers& solvers,
     nominalValues.set_p(0,p_schoof);
     fo_model->setNominalValues(nominalValues);
 
+    for (size_t ib=0; ib<num_buckets; ++ib) {
+      // Set computed effective pressure in ice mesh
+      auto eff_press_hydro = hydro_states[ib].at(effPressName);
+      auto eff_press_fo = fo_basal_states[ib].at(effPressName+"_"+basalSideName);
+
+      ALBANY_ASSERT(eff_press_hydro.size()==eff_press_fo.size(),
+                    "Error! Something is wrong with states dimensions.\n");
+      for (auto i = decltype(eff_press_fo.size())(0); i<eff_press_fo.size(); ++i) {
+        eff_press_fo(i) = eff_press_hydro(i);
+      }
+    }
+
     Piro::PerformSolve(*fo_solver,fo_factory->getAnalysisParameters().sublist("Solve"),p);
   }
   return 0;
-}
-
-Teuchos::RCP<Albany::ModelEvaluator> getAlbanyME (Teuchos::RCP<Thyra_ModelEvaluator> me)
-{
-  using DMEWSF = Thyra::DefaultModelEvaluatorWithSolveFactory<double>;
-  using AME    = Albany::ModelEvaluator;
-
-  // Note: all casts should go through, so throw if one doesn't work
-
-  auto nox_solver = Teuchos::rcp_dynamic_cast<Piro::NOXSolver<ST>>(me,true);
-  auto model = nox_solver->getSolver()->getModel();
-  auto model_wsf = Teuchos::rcp_dynamic_cast<const DMEWSF>(model);
-  return Teuchos::rcp_dynamic_cast<const AME>(model_wsf->getUnderlyingModel(),true);
 }
