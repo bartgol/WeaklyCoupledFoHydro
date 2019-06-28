@@ -82,8 +82,8 @@ int main(int argc, char** argv) {
 
   // Read input line
   std::string fo_inv_fname = "input_fo_inverse.yaml";
-  std::string fo_fwd_fname = "input_hydro_inverse.yaml";
-  std::string hydro_inv_fname = "input_fo_forward.yaml";
+  std::string fo_fwd_fname = "input_fo_forward.yaml";
+  std::string hydro_inv_fname = "input_hydro_inverse.yaml";
   std::string coupling_fname = "input_coupling.yaml";
 
   if (argc>1) {
@@ -139,6 +139,15 @@ AlbanySolvers create_solvers(const std::string& fo_inv_fname,
 
   // Get the comm
   Teuchos::RCP<const Teuchos_Comm> comm = Albany::getDefaultComm();
+
+  Teuchos::RCP<Teuchos::FancyOStream> out;
+  out = Teuchos::VerboseObjectBase::getDefaultOStream();
+  out->setProcRankAndSize(comm->getRank(),comm->getSize());
+  out->setOutputToRootOnly(0);
+  *out << "   +------------------------------------------------------------+\n"
+       << "   |            Creating the ice and hydrology solvers          |\n"
+       << "   +------------------------------------------------------------+\n"
+       << "\n";
 
   AlbanySolvers solvers;
 
