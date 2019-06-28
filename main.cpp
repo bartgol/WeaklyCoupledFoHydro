@@ -30,6 +30,17 @@ struct AlbanySolvers {
   Teuchos::RCP<TROME> m_inv_hydro_solver;
   Teuchos::RCP<TROME> m_fwd_fo_solver;
 
+  Teuchos::RCP<Albany::CombineAndScatterManager> m_sliding_cas;
+  Teuchos::RCP<Albany::CombineAndScatterManager> m_traction_cas;
+  Teuchos::RCP<Albany::CombineAndScatterManager> m_eff_press_cas;
+
+  Teuchos::RCP<Thyra_Vector> m_sliding_fo;
+  Teuchos::RCP<Thyra_Vector> m_traction_fo;
+  Teuchos::RCP<Thyra_Vector> m_eff_press_fo;
+  Teuchos::RCP<Thyra_Vector> m_sliding_hydro;
+  Teuchos::RCP<Thyra_Vector> m_traction_hydro;
+  Teuchos::RCP<Thyra_Vector> m_eff_press_hydro;
+
   int m_max_iters;
   int m_tolerance;
 };
@@ -43,6 +54,14 @@ int run_initialization_problem (const AlbanySolvers& solvers,
                                 Teuchos::RCP<Teuchos::FancyOStream> out);
 int run_iterative_inversion_problem (const AlbanySolvers& solvers,
                                      Teuchos::RCP<Teuchos::FancyOStream> out);
+
+void copyToHydro (const AlbanySolvers& solvers,
+                  const Teuchos::RCP<Albany::AbstractDiscretization> fo_basal_disc,
+                  const Teuchos::RCP<Albany::AbstractDiscretization> hydro_disc);
+
+void copyFromHydro (const AlbanySolvers& solvers,
+                    const Teuchos::RCP<Albany::AbstractDiscretization> fo_basal_disc,
+                    const Teuchos::RCP<Albany::AbstractDiscretization> hydro_disc);
 
 /////////////// IMPLEMENTATIONS /////////////////////
 
@@ -171,6 +190,30 @@ AlbanySolvers create_solvers(const std::string& fo_inv_fname,
   solvers.m_max_iters = params->get<int>("Max Iters",10);
   solvers.m_tolerance = params->get<RealType>("Relative Tolerance",1e-3);
 
+  // Create cas managers
+  auto basalSideName = solvers.m_fwd_fo_factory->returnModel()->getApp()->getProblemPL()->get<std::string>("Basal Side Name");
+  const auto fo_basal_disc = solvers.m_fwd_fo_factory->returnModel()->getApp()->getDiscretization()->getSideSetDiscretizations().at(basalSideName);
+  const auto hydro_disc    = solvers.m_inv_hydro_factory->returnModel()->getApp()->getDiscretization();
+
+  const std::string slidingVelName = "sliding_velocity";
+  const std::string tractionName   = "basal_traction";
+  const std::string effPressName   = "effective_pressure";
+
+  solvers.m_sliding_cas = Albany::createCombineAndScatterManager(fo_basal_disc->getVectorSpace(slidingVelName),
+                                                                 hydro_disc->getOverlapVectorSpace(slidingVelName));
+  solvers.m_traction_cas = Albany::createCombineAndScatterManager(fo_basal_disc->getVectorSpace(tractionName),
+                                                                  hydro_disc->getOverlapVectorSpace(tractionName));
+  solvers.m_eff_press_cas = Albany::createCombineAndScatterManager(fo_basal_disc->getVectorSpace(effPressName),
+                                                                   hydro_disc->getOverlapVectorSpace(effPressName));
+
+  // Create thyra vectors to help with cas import/export
+  solvers.m_sliding_fo      = Thyra::createMember(solvers.m_sliding_cas->getOwnedVectorSpace());
+  solvers.m_sliding_hydro   = Thyra::createMember(solvers.m_sliding_cas->getOverlappedVectorSpace());
+  solvers.m_traction_fo     = Thyra::createMember(solvers.m_traction_cas->getOwnedVectorSpace());
+  solvers.m_traction_hydro  = Thyra::createMember(solvers.m_traction_cas->getOverlappedVectorSpace());
+  solvers.m_eff_press_fo    = Thyra::createMember(solvers.m_eff_press_cas->getOwnedVectorSpace());
+  solvers.m_eff_press_hydro = Thyra::createMember(solvers.m_eff_press_cas->getOverlappedVectorSpace());
+
   return solvers;
 }
 
@@ -196,43 +239,11 @@ int run_initialization_problem (const AlbanySolvers& solvers,
   Teuchos::Array<Teuchos::Array<Teuchos::RCP<const Thyra_MultiVector>>> sensitivities;
   Piro::PerformSolve(*fo_solver,fo_factory->getAnalysisParameters(),responses,sensitivities);
 
-  // Set basal traction and sliding velocity in the hydrology discretization
-  auto hydro_solver  = solvers.m_inv_hydro_solver;
-  auto hydro_factory = solvers.m_inv_hydro_factory;
-  auto hydro_model   = hydro_factory->returnModel();
-
   auto basalSideName = fo_model->getApp()->getProblemPL()->get<std::string>("Basal Side Name");
 
   auto fo_basal_disc = fo_model->getApp()->getDiscretization()->getSideSetDiscretizations().at(basalSideName);
-  auto hydro_disc    = hydro_model->getApp()->getDiscretization();
-
-  auto fo_basal_states = fo_basal_disc->getStateArrays().nodeStateArrays;
-  auto hydro_states = hydro_disc->getStateArrays().nodeStateArrays;
-
-  const size_t num_buckets = fo_basal_states.size();
-  const std::string slidingVelName = "sliding_velocity";
-  const std::string tractionName   = "basal_traction";
-  for (size_t ib=0; ib<num_buckets; ++ib) {
-    // Set computed sliding velocity on basal mesh
-    auto sliding_v_hydro = hydro_states[ib].at(slidingVelName);
-    auto sliding_v_fo = fo_basal_states[ib].at(slidingVelName+"_"+basalSideName);
-
-    ALBANY_ASSERT(sliding_v_hydro.size()==sliding_v_fo.size(),
-                  "Error! Something is wrong with states dimensions.\n");
-    for (auto i = decltype(sliding_v_fo.size())(0); i<sliding_v_fo.size(); ++i) {
-      sliding_v_hydro(i) = sliding_v_fo(i);
-    }
-
-    // Set computed traction field on mesh
-    auto traction_hydro = hydro_states[ib].at(slidingVelName);
-    auto traction_fo = fo_basal_states[ib].at(slidingVelName+"_"+basalSideName);
-
-    ALBANY_ASSERT(traction_hydro.size()==traction_fo.size(),
-                  "Error! Something is wrong with states dimensions.\n");
-    for (auto i = decltype(traction_fo.size())(0); i<traction_fo.size(); ++i) {
-      traction_hydro(i) = traction_fo(i);
-    }
-  }
+  auto hydro_disc    = solvers.m_inv_hydro_factory->returnModel()->getApp()->getDiscretization();
+  copyToHydro(solvers, fo_basal_disc, hydro_disc);
 
   return 0;
 }
@@ -267,7 +278,7 @@ int run_iterative_inversion_problem (const AlbanySolvers& solvers,
   auto fo_basal_disc = fo_model->getApp()->getDiscretization()->getSideSetDiscretizations().at(basalSideName);
   auto hydro_disc    = hydro_model->getApp()->getDiscretization();
 
-  auto fo_basal_states = fo_basal_disc->getStateArrays().nodeStateArrays;
+  auto fo_basal_states = fo_basal_disc->getStateArrays().elemStateArrays;
   auto hydro_states = hydro_disc->getStateArrays().nodeStateArrays;
 
   const size_t num_buckets = fo_basal_states.size();
@@ -285,27 +296,8 @@ int run_iterative_inversion_problem (const AlbanySolvers& solvers,
     Session::reset_build_type(hydro_bt);
 
     // Set inputs in hydrology discretization
-    for (size_t ib=0; ib<num_buckets; ++ib) {
-      // Set computed sliding velocity on basal mesh
-      auto sliding_v_hydro = hydro_states[ib].at(slidingVelName);
-      auto sliding_v_fo = fo_basal_states[ib].at(slidingVelName+"_"+basalSideName);
+    copyToHydro(solvers, fo_basal_disc, hydro_disc);
 
-      ALBANY_ASSERT(sliding_v_hydro.size()==sliding_v_fo.size(),
-                    "Error! Something is wrong with states dimensions.\n");
-      for (auto i = decltype(sliding_v_fo.size())(0); i<sliding_v_fo.size(); ++i) {
-        sliding_v_hydro(i) = sliding_v_fo(i);
-      }
-
-      // Set computed traction field on mesh
-      auto traction_hydro = hydro_states[ib].at(slidingVelName);
-      auto traction_fo = fo_basal_states[ib].at(slidingVelName+"_"+basalSideName);
-
-      ALBANY_ASSERT(traction_hydro.size()==traction_fo.size(),
-                    "Error! Something is wrong with states dimensions.\n");
-      for (auto i = decltype(traction_fo.size())(0); i<traction_fo.size(); ++i) {
-        traction_hydro(i) = traction_fo(i);
-      }
-    }
     status = Piro::PerformAnalysis(*hydro_solver,hydro_factory->getAnalysisParameters(),p);
 
     // If something went wrong, quit
@@ -323,19 +315,149 @@ int run_iterative_inversion_problem (const AlbanySolvers& solvers,
     nominalValues.set_p(0,p_schoof);
     fo_model->setNominalValues(nominalValues);
 
-    for (size_t ib=0; ib<num_buckets; ++ib) {
-      // Set computed effective pressure in ice mesh
-      auto eff_press_hydro = hydro_states[ib].at(effPressName);
-      auto eff_press_fo = fo_basal_states[ib].at(effPressName+"_"+basalSideName);
-
-      ALBANY_ASSERT(eff_press_hydro.size()==eff_press_fo.size(),
-                    "Error! Something is wrong with states dimensions.\n");
-      for (auto i = decltype(eff_press_fo.size())(0); i<eff_press_fo.size(); ++i) {
-        eff_press_fo(i) = eff_press_hydro(i);
-      }
-    }
+    copyFromHydro(solvers, fo_basal_disc, hydro_disc);
 
     Piro::PerformSolve(*fo_solver,fo_factory->getAnalysisParameters().sublist("Solve"),p);
   }
   return 0;
+}
+
+void copyToHydro (const AlbanySolvers& solvers,
+                  const Teuchos::RCP<Albany::AbstractDiscretization> fo_basal_disc,
+                  const Teuchos::RCP<Albany::AbstractDiscretization> hydro_disc) {
+  const std::string slidingVelName = "sliding_velocity";
+  const std::string tractionName   = "basal_traction";
+
+  solvers.m_sliding_fo->assign(0.0);
+  solvers.m_traction_fo->assign(0.0);
+
+  // Copy from fo stk structures into Thyra_Vector's
+  const auto fo_basal_states  = fo_basal_disc->getStateArrays().elemStateArrays;
+  const size_t num_fo_buckets = fo_basal_states.size();
+  auto sliding_fo_thyra_data  = Albany::getNonconstLocalData(solvers.m_sliding_fo);
+  auto traction_fo_thyra_data = Albany::getNonconstLocalData(solvers.m_traction_fo);
+  auto traction_fo_dof_manager   = fo_basal_disc->getDOFManager(tractionName);
+  for (size_t ib=0; ib<num_fo_buckets; ++ib) {
+    // Get arrays from basal mesh
+    const auto sliding_v_fo = fo_basal_states[ib].at(slidingVelName);
+    const auto traction_fo  = fo_basal_states[ib].at(slidingVelName);
+
+    // Loop over elem/nodes in the workset, and copy over to Thyra 
+    const int num_elems = sliding_v_fo.dimension(0);
+    const int num_nodes = sliding_v_fo.dimension(1);
+    const auto& ElNodeID = fo_basal_disc->getWsElNodeID()[ib];
+    for (int ielem=0; ielem<num_elems; ++ielem) {
+      for (int inode=0; inode<num_nodes; ++inode) {
+        const GO node_gid = ElNodeID[ielem][inode];
+        const LO node_lid = Albany::getLocalElement(solvers.m_sliding_fo->space(),node_gid);
+
+        // Only process local nodes, ghosted ones will be imported
+        if (Albany::locallyOwnedComponent(Albany::getSpmdVectorSpace(solvers.m_sliding_fo->space()),node_gid)) {
+          sliding_fo_thyra_data[node_lid] = sliding_v_fo(ielem,inode);
+
+          // For velocity, use its dof manager, cause you don't know if it's interleaved
+          for (int icomp=0; icomp<2; ++icomp) {
+            const GO dof_gid = traction_fo_dof_manager.getGlobalDOF(node_gid,icomp);
+            const LO dof_lid = Albany::getLocalElement(solvers.m_traction_fo->space(),dof_gid);
+            traction_fo_thyra_data[dof_lid] = traction_fo(ielem,inode,icomp);
+          }
+        }
+      }
+    }
+  }
+
+  // Export
+  solvers.m_sliding_hydro->assign(0.0);
+  solvers.m_traction_hydro->assign(0.0);
+  solvers.m_sliding_cas->scatter(solvers.m_sliding_fo,solvers.m_sliding_hydro,Albany::CombineMode::INSERT);
+  solvers.m_traction_cas->scatter(solvers.m_traction_fo,solvers.m_traction_hydro,Albany::CombineMode::INSERT);
+
+  // Copy from Thyra_Vector's into hydro stk structures
+  auto hydro_states = hydro_disc->getStateArrays().elemStateArrays;
+  const size_t num_hydro_buckets  = hydro_states.size();
+  auto sliding_hydro_thyra_data   = Albany::getLocalData(solvers.m_sliding_hydro.getConst());
+  auto traction_hydro_thyra_data  = Albany::getLocalData(solvers.m_traction_hydro.getConst());
+  auto traction_hydro_dof_manager = hydro_disc->getDOFManager(tractionName);
+  for (size_t ib=0; ib<num_hydro_buckets; ++ib) {
+    // Get arrays from mesh
+    const auto sliding_v_hydro = hydro_states[ib].at(slidingVelName);
+    const auto traction_hydro  = hydro_states[ib].at(slidingVelName);
+
+    // Loop over elem/nodes in the workset, and copy over to Thyra 
+    const int num_elems = sliding_v_hydro.dimension(0);
+    const int num_nodes = sliding_v_hydro.dimension(1);
+    const auto& ElNodeID = hydro_disc->getWsElNodeID()[ib];
+    for (int ielem=0; ielem<num_elems; ++ielem) {
+      for (int inode=0; inode<num_nodes; ++inode) {
+        const GO node_gid = ElNodeID[ielem][inode];
+        const LO node_lid = Albany::getLocalElement(solvers.m_sliding_hydro->space(),node_gid);
+        sliding_v_hydro (ielem,inode) = sliding_hydro_thyra_data[node_lid] ;
+
+        // For velocity, use its dof manager, cause you don't know if it's interleaved
+        for (int icomp=0; icomp<2; ++icomp) {
+          const GO dof_gid = traction_hydro_dof_manager.getGlobalDOF(node_gid,icomp);
+          const LO dof_lid = Albany::getLocalElement(solvers.m_traction_hydro->space(),dof_gid);
+          traction_hydro(ielem,inode,icomp) = traction_hydro_thyra_data[dof_lid];
+        }
+      }
+    }
+  }
+}
+
+void copyFromHydro (const AlbanySolvers& solvers,
+                  const Teuchos::RCP<Albany::AbstractDiscretization> fo_basal_disc,
+                  const Teuchos::RCP<Albany::AbstractDiscretization> hydro_disc) {
+  const std::string effPressName   = "effective_pressure";
+
+  solvers.m_eff_press_hydro->assign(0.0);
+
+  // Copy from fo stk structures into Thyra_Vector's
+  auto hydro_states = hydro_disc->getStateArrays().elemStateArrays;
+  const size_t num_hydro_buckets  = hydro_states.size();
+  auto eff_press_hydro_thyra_data   = Albany::getNonconstLocalData(solvers.m_eff_press_hydro);
+  for (size_t ib=0; ib<num_hydro_buckets; ++ib) {
+    // Get arrays from basal mesh
+    const auto eff_press_hydro = hydro_states[ib].at(effPressName);
+
+    // Loop over elem/nodes in the workset, and copy over to Thyra 
+    const int num_elems = eff_press_hydro.dimension(0);
+    const int num_nodes = eff_press_hydro.dimension(1);
+    const auto& ElNodeID = hydro_disc->getWsElNodeID()[ib];
+    for (int ielem=0; ielem<num_elems; ++ielem) {
+      for (int inode=0; inode<num_nodes; ++inode) {
+        const GO node_gid = ElNodeID[ielem][inode];
+
+        // Only process local nodes, ghosted ones will be imported
+        if (Albany::locallyOwnedComponent(Albany::getSpmdVectorSpace(solvers.m_eff_press_hydro->space()),node_gid)) {
+          const LO node_lid = Albany::getLocalElement(solvers.m_eff_press_hydro->space(),node_gid);
+          eff_press_hydro_thyra_data[node_lid] = eff_press_hydro(ielem,inode);
+        }
+      }
+    }
+  }
+
+  // Export
+  solvers.m_eff_press_fo->assign(0.0);
+  solvers.m_eff_press_cas->scatter(solvers.m_eff_press_hydro,solvers.m_eff_press_fo,Albany::CombineMode::INSERT);
+
+  // Copy from Thyra_Vector's into hydro stk structures
+  const auto fo_basal_states  = fo_basal_disc->getStateArrays().elemStateArrays;
+  const size_t num_fo_buckets = fo_basal_states.size();
+  auto eff_press_fo_thyra_data  = Albany::getNonconstLocalData(solvers.m_eff_press_fo);
+  for (size_t ib=0; ib<num_fo_buckets; ++ib) {
+    // Get arrays from mesh
+    const auto eff_press_fo = fo_basal_states[ib].at(effPressName);
+
+    // Loop over elem/nodes in the workset, and copy over to Thyra 
+    const int num_elems = eff_press_fo.dimension(0);
+    const int num_nodes = eff_press_fo.dimension(1);
+    const auto& ElNodeID = fo_basal_disc->getWsElNodeID()[ib];
+    for (int ielem=0; ielem<num_elems; ++ielem) {
+      for (int inode=0; inode<num_nodes; ++inode) {
+        const GO node_gid = ElNodeID[ielem][inode];
+        const LO node_lid = Albany::getLocalElement(solvers.m_eff_press_fo->space(),node_gid);
+        eff_press_fo (ielem,inode) = eff_press_fo_thyra_data[node_lid] ;
+      }
+    }
+  }
 }

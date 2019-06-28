@@ -22,7 +22,7 @@ ANONYMOUS:
         Name: Squared L2 Difference Side Source ST Target PST
         Side Set Name: basalside
         Field Rank: Vector
-        Source Field Name: basal_traction
+        Source Field Name: basal_traction_basalside
         Target Value: 0.0
     Dirichlet BCs: { }
     Neumann BCs: { }
@@ -39,7 +39,7 @@ ANONYMOUS:
         Cubature Degree: 3
         Side Set Name: lateralside
     Simple Evaluators:
-      Number: 1
+      Number: 2
       Evaluator 0:
         Type: Binary Prod
         Side Set Name: basalside
@@ -47,7 +47,16 @@ ANONYMOUS:
         Field Layout: QuadPoint Vector
         Parameter Field Name: beta_basalside
         Parameter Field Layout: QuadPoint Scalar
-        Output Field Name: basal_traction
+        Output Field Name: basal_traction_basalside
+        Input Field ST: Scalar
+      Evaluator 1:
+        Type: Binary Prod
+        Side Set Name: basalside
+        Input Field Name: Velocity_basalside
+        Field Layout: Node Vector
+        Parameter Field Name: beta_basalside
+        Parameter Field Layout: Node Scalar
+        Output Field Name: basal_traction_basalside
         Input Field ST: Scalar
     Equation Set: 
       Type: LandIce
@@ -116,9 +125,9 @@ ANONYMOUS:
         Cubature Degree: 3
         Use Serial Mesh: true
         Exodus Input File Name: ./mesh/gis_unstruct_2d.exo
-        Build Node Sets From Side Sets: true
+        Build States DOF Structs: true
         Required Fields Info: 
-          Number Of Fields: 4
+          Number Of Fields: 6
           Field 0: 
             Field Name: ice_thickness
             Field Type: Node Scalar
@@ -140,6 +149,14 @@ ANONYMOUS:
             Field Type: Node Scalar
             Field Origin: File
             File Name: ./ascii/basal_friction_log.ascii
+          Field 4: 
+            Field Name: sliding_velocity
+            Field Type: Node Scalar
+            Field Usage: Output
+          Field 5: 
+            Field Name: basal_traction
+            Field Type: Node Vector
+            Field Usage: Output
       upperside: 
         Method: SideSetSTK
         Number Of Time Derivatives: 0

@@ -52,10 +52,6 @@ ANONYMOUS:
       Ice Latent Heat: 3.35000000000000000e+05
       Gravity Acceleration: 9.80000000000000071e+00
       Clausius-Clapeyron Coefficient: 0.00000000000000000e+00
-    LandIce Field Norm: 
-      sliding_velocity: 
-        Regularization Type: Given Value
-        Regularization Value: 1.00000000000000004e-10
     LandIce Viscosity: 
       Glen's Law n: 3.00000000000000000e+00
     LandIce Hydrology: 
@@ -105,8 +101,9 @@ ANONYMOUS:
     Exodus Input File Name: ./mesh/gis_unstruct_2d.exo
     Exodus Output File Name: ./mesh/hydrology.exo
     Build Node Sets From Side Sets: true
+    Build States DOF Structs: true
     Required Fields Info: 
-      Number Of Fields: 9
+      Number Of Fields: 10
       Field 0: 
         Field Name: ice_thickness
         Field Type: Node Scalar
@@ -123,27 +120,30 @@ ANONYMOUS:
         Field Origin: File
         Field Value: [5.47999999999999972e+01]
       Field 3: 
-        Field Name: basal_velocity
-        Field Type: Node Vector
-        Vector Dim: 2
+        Field Name: sliding_velocity
+        Field Type: Node Scalar
         Field Origin: Mesh
       Field 4: 
+        Field Name: basal_traction
+        Field Type: Node Vector
+        Field Origin: Mesh
+      Field 5: 
         Field Name: effective_pressure
         Field Type: Node Scalar
         Field Usage: Output
-      Field 5: 
+      Field 6: 
         Field Name: water_thickness
         Field Type: Node Scalar
         Field Usage: Output
-      Field 6: 
+      Field 7: 
         Field Name: hydraulic_potential
         Field Type: Node Scalar
         Field Usage: Output
-      Field 7: 
+      Field 8: 
         Field Name: ice_overburden
         Field Type: Node Scalar
         Field Usage: Output
-      Field 8: 
+      Field 9: 
         Field Name: water_discharge
         Field Type: Elem Vector
         Field Usage: Output
